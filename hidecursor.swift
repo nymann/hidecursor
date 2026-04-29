@@ -1,4 +1,6 @@
-import Cocoa
+import CoreGraphics
+import CoreFoundation
+import Dispatch
 
 // Private CGS API: setting "SetsCursorInBackground" on our connection lets
 // CGDisplayHideCursor work from a background daemon, which the public API
@@ -11,27 +13,74 @@ func _CGSDefaultConnection() -> CGSConnectionID
 @_silgen_name("CGSSetConnectionProperty")
 func CGSSetConnectionProperty(_ cid: CGSConnectionID, _ targetCID: CGSConnectionID, _ key: CFString, _ value: CFTypeRef) -> Int32
 
-func setCursorHidden(_ hide: Bool) {
-    let cid = _CGSDefaultConnection()
-    _ = CGSSetConnectionProperty(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
-    if hide { CGDisplayHideCursor(CGMainDisplayID()) }
-    else    { CGDisplayShowCursor(CGMainDisplayID()) }
+protocol IdleObserver: AnyObject {
+    func idleStateDidChange(isIdle: Bool)
 }
 
-let idleThreshold: TimeInterval = 2.0
-var lastPos = NSEvent.mouseLocation
-var lastChange = Date()
-var hidden = false
+final class Cursor: IdleObserver {
+    private(set) var isHidden = false
 
-Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
-    let p = NSEvent.mouseLocation
-    if p != lastPos {
-        lastPos = p
-        lastChange = Date()
-        if hidden { setCursorHidden(false); hidden = false }
-    } else if !hidden && Date().timeIntervalSince(lastChange) > idleThreshold {
-        setCursorHidden(true); hidden = true
+    init() {
+        let cid = _CGSDefaultConnection()
+        // 0 == kCFStringEncodingMacRoman; constant lives in Foundation's
+        // overlay which we don't import. Pure ASCII works fine.
+        let key = CFStringCreateWithCString(nil, "SetsCursorInBackground", 0)!
+        _ = CGSSetConnectionProperty(cid, cid, key, kCFBooleanTrue)
+    }
+
+    func hide() {
+        guard !isHidden else { return }
+        CGDisplayHideCursor(CGMainDisplayID())
+        isHidden = true
+    }
+
+    func show() {
+        guard isHidden else { return }
+        CGDisplayShowCursor(CGMainDisplayID())
+        isHidden = false
+    }
+
+    func idleStateDidChange(isIdle: Bool) {
+        if isIdle { hide() } else { show() }
     }
 }
 
-RunLoop.main.run()
+final class IdleMonitor {
+    let threshold: Double
+    private struct WeakObserver { weak var observer: IdleObserver? }
+    private var observers: [WeakObserver] = []
+    private var timer: DispatchSourceTimer?
+    private var wasIdle = false
+    private static let anyInputEventType = CGEventType(rawValue: 0xFFFFFFFF)!
+
+    init(threshold: Double) {
+        self.threshold = threshold
+    }
+
+    func subscribe(_ observer: IdleObserver) {
+        observers.append(WeakObserver(observer: observer))
+    }
+
+    func start(pollInterval: Double = 0.5) {
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now(), repeating: .milliseconds(Int(pollInterval * 1000)))
+        t.setEventHandler { [weak self] in self?.tick() }
+        t.resume()
+        timer = t
+    }
+
+    private func tick() {
+        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: IdleMonitor.anyInputEventType)
+        let nowIdle = idle >= threshold
+        guard nowIdle != wasIdle else { return }
+        wasIdle = nowIdle
+        observers.forEach { $0.observer?.idleStateDidChange(isIdle: nowIdle) }
+    }
+}
+
+let cursor = Cursor()
+let monitor = IdleMonitor(threshold: 2.0)
+monitor.subscribe(cursor)
+monitor.start()
+
+CFRunLoopRun()
